@@ -5,24 +5,23 @@ import os
 import matplotlib.pyplot as plt
 import pickle
 import warnings
+import tempfile # Added for temporary file handling
+import atexit # Added for cleanup of temporary files
 
 # Import refactored evaluation function
-from eval import run_evaluation
+from eval import evaluate_metrics # Only need evaluate_metrics here
 
-# Import model training configurations
-from model_configurations import (
-    train_full_model,
-    train_no_temporal_model,
-    train_no_contributor_model,
-    train_no_spatial_temporal_model
-)
+# Import burst pipeline
+from burst_pipeline import run_rolling_imputation_pipeline
 
-# Import necessary functions from utils.py
+# Import gap generation and utility functions
 from utils import (
     load_and_preprocess_data,
     add_temporal_features,
     build_distance_matrix,
-    build_connectivity_matrix
+    build_connectivity_matrix,
+    create_contiguous_segment_gaps,
+    create_single_point_gaps
 )
 
 warnings.filterwarnings('ignore') # Suppress warnings for cleaner output
@@ -35,167 +34,276 @@ def main():
     summary_file_path = os.path.join(base_output_dir, "multi_period_model_comparison_summary.txt")
     # Clear content of summary file from previous runs
     with open(summary_file_path, 'w') as f:
-        f.write("--- Comprehensive Multi-Period Model Evaluation Summary ---\n")
+        f.write("--- Comprehensive Burst Pipeline Evaluation Summary ---\n") # Updated title
         f.write("Generated on: " + pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
         f.write("="*80 + "\n")
 
-    print("--- Starting Hydrological Data Imputation Multi-Model, Multi-Period Evaluation ---")
+    print("--- Starting Bursting Imputation Pipeline Evaluation ---") # Updated title
 
-    # 1. Load and Preprocess Data (load once as raw data)
-    # NOTE: The paths are assumed to be accessible in the environment.
-    discharge_path = 'discharge_data_cleaned.csv'
-    lat_long_path = 'lat_long_discharge.csv'
-    df_data_full_period, df_lat_long = load_and_preprocess_data(discharge_path, lat_long_path)
-
-    if df_data_full_period is None:
-        print("Data loading failed. Exiting.")
+    # Define paths to your data files
+    DISCHARGE_DATA_PATH = 'discharge_data_cleaned.csv'
+    LAT_LONG_DATA_PATH = 'lat_long_discharge.csv'
+    CONTRIBUTOR_DATA_PATH = 'mahanadi_contribs.csv'
+    
+    # 1. Load and Preprocess Data to get the original, complete data for gap generation
+    print("\n--- Loading original data for gap generation ---")
+    df_original_raw, df_contrib, df_coords, vcode_to_station_name, station_name_to_vcode = \
+        load_and_preprocess_data(DISCHARGE_DATA_PATH, LAT_LONG_DATA_PATH, CONTRIBUTOR_DATA_PATH)
+    
+    if df_original_raw is None:
+        print("FATAL ERROR: Failed to load original data. Exiting.")
         return
 
-    # Get a list of all discharge columns to use throughout the evaluation
-    discharge_cols = [col for col in df_data_full_period.columns if not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))]
+    # Add temporal features to the original raw data for consistency with pipeline input
+    df_original_with_features = add_temporal_features(df_original_raw)
 
-    # 2. Add temporal features for all data. These will be subset later for each period.
-    df_data_full_period = add_temporal_features(df_data_full_period)
-    temporal_features = ['day_of_year_sin', 'day_of_year_cos']
+    # Identify all discharge columns from the original data
+    discharge_cols_overall = [col for col in df_original_raw.columns if not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))]
 
-    # 3. Build static spatial and connectivity matrices for the entire dataset
-    # These will be subsetted for each specific training period later.
-    distance_matrix_overall = build_distance_matrix(df_lat_long, discharge_cols)
-    connectivity_matrix_overall = build_connectivity_matrix(df_lat_long, discharge_cols) # assuming contrib_path is now part of lat_long file or we need a new file
+    print("\n--- Starting Evaluation of Bursting Pipeline Output on Artificial Gaps ---")
 
-    # 4. Define evaluation windows (rolling periods)
-    # The first training period is defined explicitly, then we'll roll forward
-    training_period_size = 5 # years
-    evaluation_period_size = 5 # years
-    
-    # Example: Start a rolling evaluation from a specific year.
-    # Here, we'll just run one large evaluation for demonstration, but the loop would go here.
-    train_start_year = 1980
-    train_end_year = train_start_year + training_period_size - 1
-    
-    eval_start_year = train_end_year + 1
-    eval_end_year = eval_start_year + evaluation_period_size - 1
-    
-    # 5. Loop through each training and evaluation period
-    # For now, we'll do just one period as an example.
-    
-    # Subsetting the data for the current period
-    df_train_period = df_data_full_period.loc[str(train_start_year):str(train_end_year)].copy()
-    df_test_period = df_data_full_period.loc[str(eval_start_year):str(eval_end_year)].copy()
-    
-    # Check for empty dataframes
-    if df_train_period.empty or df_test_period.empty:
-        print(f"Warning: Training or testing data for period {train_start_year}-{eval_end_year} is empty. Skipping.")
+    # Define gap lengths to test
+    gap_lengths_contiguous = [7, 14, 21, 30, 60, 180, 365]
+    gap_lengths_single_point = [30, 60, 90, 120, 180, 365]
+
+    all_evaluation_metrics = []
+
+    # List to keep track of temporary files for cleanup
+    temp_files_to_clean = []
+
+    # Register cleanup function to run on exit
+    def cleanup_temp_files():
+        for f_path in temp_files_to_clean:
+            if os.path.exists(f_path):
+                os.remove(f_path)
+                print(f"Cleaned up temporary file: {f_path}")
+    atexit.register(cleanup_temp_files)
+
+    # --- Evaluate Contiguous Gaps ---
+    if gap_lengths_contiguous:
+        print("\n--- Evaluating Contiguous Segment Gaps ---")
+        for length in gap_lengths_contiguous:
+            print(f"\n  Processing {length}-day contiguous gaps...")
+            
+            # 1. Create a gapped dataset for this specific scenario
+            results_gaps = create_contiguous_segment_gaps(
+                df_original_with_features, discharge_cols_overall, [length], random_seed=42
+            ) # Pass [length] as create_contiguous_segment_gaps expects a list
+            current_gapped_data = results_gaps[length]['gapped_data']
+            current_true_values_dict = results_gaps[length]['true_values']
+            current_mask_dict = results_gaps[length]['mask']
+
+            # 2. Save the gapped data to a temporary CSV file
+            temp_gapped_discharge_file = tempfile.NamedTemporaryFile(mode='w', suffix='_gapped.csv', delete=False)
+            current_gapped_data.to_csv(temp_gapped_discharge_file.name, index=True, date_format='%Y-%m-%d')
+            temp_gapped_discharge_file.close()
+            temp_files_to_clean.append(temp_gapped_discharge_file.name)
+            print(f"  Temporary gapped data saved to: {temp_gapped_discharge_file.name}")
+
+            # 3. Run the Bursting Imputation Pipeline with the temporarily gapped data
+            print(f"  Running Burst Pipeline on gapped data for {length}-day contiguous gaps...")
+            df_imputed_by_pipeline = run_rolling_imputation_pipeline(
+                discharge_path=temp_gapped_discharge_file.name,
+                lat_long_path=LAT_LONG_DATA_PATH,
+                contrib_path=CONTRIBUTOR_DATA_PATH,
+                initial_train_window_size=5,
+                imputation_chunk_size_years=5,
+                overall_min_year=df_original_raw.index.year.min(), # Use actual min year of data
+                overall_max_year=df_original_raw.index.year.max(), # Use actual max year of data
+                min_completeness_percent_train=70.0,
+                output_dir=os.path.join(base_output_dir, f"burst_output_contiguous_{length}") # Separate output for each run
+            )
+
+            if df_imputed_by_pipeline is None or df_imputed_by_pipeline.empty:
+                print(f"Warning: Pipeline failed for {length}-day contiguous gaps. Skipping metrics.")
+                continue
+
+            # 4. Extract true and imputed values and calculate global metrics
+            y_true_all_gaps = []
+            y_pred_all_gaps = []
+
+            for col in discharge_cols_overall:
+                y_true_all_gaps.extend(current_true_values_dict[col])
+                gapped_indices_for_col = df_original_with_features.index[current_mask_dict[col]]
+                
+                if col in df_imputed_by_pipeline.columns:
+                    y_pred_col = df_imputed_by_pipeline.loc[gapped_indices_for_col, col].values
+                    y_pred_all_gaps.extend(y_pred_col)
+                else:
+                    print(f"Warning: Column {col} not found in imputed pipeline output for {length}-day contiguous gaps.")
+                    y_pred_all_gaps.extend([np.nan] * len(current_true_values_dict[col]))
+
+            y_true_global = np.array(y_true_all_gaps)
+            y_pred_global = np.array(y_pred_all_gaps)
+                
+            metrics = evaluate_metrics(y_true_global, y_pred_global)
+            metrics['Gap Type'] = 'Contiguous'
+            metrics['Gap Length'] = length
+            metrics['Model'] = 'Burst Pipeline'
+            all_evaluation_metrics.append(metrics)
+            print(f"  Global Metrics for {length}-day contiguous gaps (Burst Pipeline): {metrics}")
+
+    # --- Evaluate Single Point Gaps ---
+    if gap_lengths_single_point:
+        print("\n--- Evaluating Single Data Point Gaps ---")
+        for length in gap_lengths_single_point:
+            print(f"\n  Processing {length}-day equivalent single point gaps...")
+            
+            # 1. Create a gapped dataset for this specific scenario
+            single_point_gaps_config = {length: length}
+            results_gaps = create_single_point_gaps(
+                df_original_with_features, discharge_cols_overall, single_point_gaps_config, random_seed=42
+            )
+            current_gapped_data = results_gaps[length]['gapped_data']
+            current_true_values_dict = results_gaps[length]['true_values']
+            current_mask_dict = results_gaps[length]['mask']
+
+            # 2. Save the gapped data to a temporary CSV file
+            temp_gapped_discharge_file = tempfile.NamedTemporaryFile(mode='w', suffix='_gapped.csv', delete=False)
+            current_gapped_data.to_csv(temp_gapped_discharge_file.name, index=True, date_format='%Y-%m-%d')
+            temp_gapped_discharge_file.close()
+            temp_files_to_clean.append(temp_gapped_discharge_file.name)
+            print(f"  Temporary gapped data saved to: {temp_gapped_discharge_file.name}")
+
+            # 3. Run the Bursting Imputation Pipeline with the temporarily gapped data
+            print(f"  Running Burst Pipeline on gapped data for {length}-day equivalent single point gaps...")
+            df_imputed_by_pipeline = run_rolling_imputation_pipeline(
+                discharge_path=temp_gapped_discharge_file.name,
+                lat_long_path=LAT_LONG_DATA_PATH,
+                contrib_path=CONTRIBUTOR_DATA_PATH,
+                initial_train_window_size=5,
+                imputation_chunk_size_years=5,
+                overall_min_year=df_original_raw.index.year.min(), # Use actual min year of data
+                overall_max_year=df_original_raw.index.year.max(), # Use actual max year of data
+                min_completeness_percent_train=70.0,
+                output_dir=os.path.join(base_output_dir, f"burst_output_single_point_{length}") # Separate output for each run
+            )
+
+            if df_imputed_by_pipeline is None or df_imputed_by_pipeline.empty:
+                print(f"Warning: Pipeline failed for {length}-day single point gaps. Skipping metrics.")
+                continue
+
+            # 4. Extract true and imputed values and calculate global metrics
+            y_true_all_gaps = []
+            y_pred_all_gaps = []
+
+            for col in discharge_cols_overall:
+                y_true_all_gaps.extend(current_true_values_dict[col])
+                gapped_indices_for_col = df_original_with_features.index[current_mask_dict[col]]
+
+                if col in df_imputed_by_pipeline.columns:
+                    y_pred_col = df_imputed_by_pipeline.loc[gapped_indices_for_col, col].values
+                    y_pred_all_gaps.extend(y_pred_col)
+                else:
+                    print(f"Warning: Column {col} not found in imputed pipeline output for {length}-day single point gaps.")
+                    y_pred_all_gaps.extend([np.nan] * len(current_true_values_dict[col]))
+            
+            y_true_global = np.array(y_true_all_gaps)
+            y_pred_global = np.array(y_pred_all_gaps)
+
+            metrics = evaluate_metrics(y_true_global, y_pred_global)
+            metrics['Gap Type'] = 'Single Point'
+            metrics['Gap Length'] = length
+            metrics['Model'] = 'Burst Pipeline'
+            all_evaluation_metrics.append(metrics)
+
+            print(f"  Global Metrics for {length}-day equivalent single point gaps (Burst Pipeline): {metrics}")
+
+    if not all_evaluation_metrics:
+        print("No evaluation metrics were generated.")
         return
 
-    # Filter spatial matrices to only include stations present in the current training period
-    present_stations = [col for col in discharge_cols if not df_train_period[col].isnull().all()]
-    distance_matrix_filtered = distance_matrix_overall.loc[present_stations, present_stations]
-    connectivity_matrix_filtered = connectivity_matrix_overall.loc[present_stations, present_stations]
+    # Convert all collected metrics to a DataFrame
+    results_df = pd.DataFrame(all_evaluation_metrics)
+    results_csv_path = os.path.join(base_output_dir, "burst_pipeline_evaluation_results.csv")
+    results_df.to_csv(results_csv_path, index=False)
+    print(f"\nAll evaluation results for Burst Pipeline saved to: {results_csv_path}")
+    print(results_df.to_string(float_format="%.4f"))
 
-    # --- Prepare a masked training set for model fitting ---
-    # We want to train the model on data that has simulated missingness
-    # First, handle existing missingness by a simple mean imputation for training
-    df_train_imputed = df_train_period[present_stations].copy()
-    for col in df_train_imputed.columns:
-        df_train_imputed[col] = df_train_imputed[col].fillna(df_train_imputed[col].mean())
+    # Append results to the summary file
+    with open(summary_file_path, 'a') as f:
+        f.write(f"\n--- Evaluation Results for: Burst Pipeline ---\n")
+        f.write(results_df.to_string(float_format="%.4f"))
+        f.write("\n" + "="*80 + "\n") # Separator
 
-    # Then, simulate 10% random missingness for model training robustness
-    np.random.seed(42)
-    train_mask_simulated = np.random.rand(*df_train_imputed.shape) < 0.1
-    df_train_masked = df_train_period.copy()
-    df_train_masked[present_stations] = df_train_imputed.mask(train_mask_simulated)
-
-    # 6. Train the different models
-    print(f"\n--- Training Models for Period {train_start_year}-{train_end_year} ---")
-
-    # Model 1: Full Model
-    full_model = train_full_model(df_train_masked, distance_matrix_filtered, connectivity_matrix_filtered, temporal_features)
-
-    # Model 2: No Temporal Features
-    no_temporal_model = train_no_temporal_model(df_train_masked, distance_matrix_filtered, connectivity_matrix_filtered, temporal_features)
-
-    # Model 3: No Contributor Info
-    no_contributor_model = train_no_contributor_model(df_train_masked, distance_matrix_filtered, connectivity_matrix_filtered, temporal_features)
-
-    # Model 4: No Spatial or Temporal Info (Baseline)
-    no_spatial_temporal_model = train_no_spatial_temporal_model(df_train_masked, distance_matrix_filtered, connectivity_matrix_filtered, temporal_features)
-
-    # Store trained models and their types in a dictionary for easy iteration
-    models_to_evaluate = {
-        'Full Model': full_model,
-        'No Temporal': no_temporal_model,
-        'No Contributor': no_contributor_model,
-        'No Spatial/Temporal': no_spatial_temporal_model
-    }
-
-    # 7. Evaluate each model on the test period
-    print(f"\n--- Evaluating Models on Test Period {eval_start_year}-{eval_end_year} ---")
-    
-    # Gap lengths to test (in days)
-    gap_lengths = [1, 3, 5, 7, 10, 14, 21, 30] 
-
-    for model_name, model in models_to_evaluate.items():
-        print(f"\nEvaluating {model_name}...")
-        model_output_dir = os.path.join(base_output_dir, model_name.replace(' ', '_').replace('/', '_'))
-        run_evaluation(model, df_test_period, gap_lengths, model_name, model_output_dir, summary_file_path)
-
-    # 8. Generate comparative plots and summary tables
     print("\n--- Generating Comparative Plots ---")
-    plot_comparisons(base_output_dir, models_to_evaluate.keys(), [f'Test Period {eval_start_year}-{eval_end_year}'])
+    plot_comparisons(base_output_dir, ['Burst Pipeline'], results_df=results_df) # Pass results_df directly
     
     print("\nEvaluation pipeline finished.")
 
-def plot_comparisons(base_output_dir, model_names, period_labels):
+def plot_comparisons(base_output_dir, model_names, results_df=None):
     """
-    Loads evaluation results from CSV files and generates comparative plots.
+    Loads evaluation results from CSV files or uses a provided DataFrame and generates comparative plots.
     """
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
     markers = ['o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
     line_styles = ['-', '--', '-.', ':']
 
-    for period_label in period_labels:
-        period_label_safe = period_label.replace(' ', '_').replace('/', '_')
-        current_period_results_for_plotting = {}
+    all_global_results = {}
+
+    if results_df is not None:
+        # If a DataFrame is provided, use it directly (assuming it's already global results)
+        for model_name in model_names:
+            # Filter for the specific model if results_df contains multiple (e.g., if you expanded later)
+            # For now, assuming results_df contains results for the single 'Burst Pipeline' model
+            all_global_results[model_name] = results_df[results_df['Model'] == model_name].set_index('Gap Length')
+    else:
         for model_name in model_names:
             model_safe_name = model_name.replace(' ', '_').replace('/', '_')
-            csv_path = os.path.join(base_output_dir, model_safe_name, "evaluation_results.csv")
-            if os.path.exists(csv_path):
-                results_df = pd.read_csv(csv_path, index_col=0)
-                current_period_results_for_plotting[model_name] = results_df
-            else:
-                print(f"Warning: CSV file not found for {model_name} in {period_label}. Skipping plot for this model.")
-        
-        if not current_period_results_for_plotting:
-            print(f"No results found for period '{period_label}'. Skipping plot generation.")
-            continue
+            csv_path = os.path.join(base_output_dir, "burst_pipeline_evaluation_results.csv") # Corrected path
 
-        metrics_to_plot = ['R2', 'RMSE', 'MAE']
-        
-        plt.figure(figsize=(20, 5))
+            if os.path.exists(csv_path):
+                results_df_from_file = pd.read_csv(csv_path)
+                global_results_df = results_df_from_file[results_df_from_file['Station'] == 'Global'].set_index('Gap Length')
+                if not global_results_df.empty:
+                    all_global_results[model_name] = global_results_df
+                else:
+                    print(f"Warning: No global results found for {model_name} in {csv_path}.")
+            else:
+                print(f"Warning: CSV file not found for {model_name} at {csv_path}. Skipping plot for this model.")
+
+    if not all_global_results:
+        print(f"No global results found across all models. Skipping comparative plot generation.")
+        return
+
+    metrics_to_plot = ['R2', 'RMSE', 'MAE', 'NSE']
+    
+    sample_model_name = list(all_global_results.keys())[0]
+    gap_lengths_for_plot = all_global_results[sample_model_name].index.unique().sort_values()
+
+    # Plotting for each Gap Type separately
+    gap_types = all_global_results[sample_model_name]['Gap Type'].unique()
+
+    for gap_type in gap_types:
+        plt.figure(figsize=(20, 10)) # Increased height for two rows of plots if needed
+        plt.suptitle(f'Burst Pipeline Evaluation - {gap_type} Gaps', fontsize=16)
+
         for i, metric in enumerate(metrics_to_plot):
-            plt.subplot(1, len(metrics_to_plot), i + 1)
-            for j, (model_name, results_df) in enumerate(current_period_results_for_plotting.items()):
-                if metric in results_df.columns:
-                    plt.plot(results_df.index, results_df[metric], 
+            plt.subplot(2, len(metrics_to_plot) // 2 if len(metrics_to_plot) > 2 else 1, i + 1)
+            for j, (model_name, results_df_model) in enumerate(all_global_results.items()):
+                # Filter by current gap type
+                df_to_plot = results_df_model[results_df_model['Gap Type'] == gap_type]
+                
+                if metric in df_to_plot.columns and not df_to_plot.empty:
+                    plt.plot(df_to_plot.index, df_to_plot[metric], 
                              marker=markers[j % len(markers)], 
                              linestyle=line_styles[j % len(line_styles)], 
                              label=model_name, 
                              color=colors[j % len(colors)])
-                
+            
             plt.xlabel('Gap Length (days)')
             plt.ylabel(metric)
-            plt.xticks(results_df.index)
-            plt.title(f'{metric} Comparison for {period_label}')
+            plt.xticks(gap_lengths_for_plot)
+            plt.title(f'{metric} Comparison')
             plt.grid(True, linestyle=':', alpha=0.7)
             if i == 0:
                 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
                 
         plt.tight_layout(rect=[0, 0, 0.88, 1])
-        plot_filename = os.path.join(base_output_dir, period_label_safe, f"comparison_metrics_{period_label_safe}.png")
+        plot_filename = os.path.join(base_output_dir, f"comparison_metrics_global_{gap_type.replace(' ', '_')}.png")
         plt.savefig(plot_filename)
         plt.close()
-        print(f"Comparative plot for period '{period_label}' saved to: {plot_filename}")
+        print(f"Global comparative plot for {gap_type} gaps saved to: {plot_filename}")
 
 if __name__ == '__main__':
     main()

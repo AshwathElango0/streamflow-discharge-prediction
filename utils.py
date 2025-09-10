@@ -87,9 +87,30 @@ def load_and_preprocess_data(discharge_path, lat_long_path, contrib_path=None):
     try:
         df_discharge = pd.read_csv(discharge_path, index_col=0, parse_dates=True, dayfirst=True)
         df_discharge.index.name = 'date'
-        df_discharge.columns = df_discharge.columns.map(clean_station_name)
-        for col in df_discharge.columns:
-            df_discharge[col] = pd.to_numeric(df_discharge[col], errors='coerce')
+        
+        # Identify actual discharge columns *before* cleaning
+        # Assuming temporal features start with 'day_of_year_', 'month_', 'week_of_year_'
+        all_cols = df_discharge.columns.tolist()
+        potential_discharge_cols = [col for col in all_cols if not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))]
+        temporal_feature_cols = [col for col in all_cols if col not in potential_discharge_cols]
+
+        # Apply clean_station_name only to actual discharge columns
+        df_discharge_stations = df_discharge[potential_discharge_cols].copy()
+        df_discharge_stations.columns = df_discharge_stations.columns.map(clean_station_name)
+        
+        # Re-combine with temporal features, if any
+        if temporal_feature_cols:
+            df_temporal_features = df_discharge[temporal_feature_cols].copy()
+            df_discharge = pd.concat([df_discharge_stations, df_temporal_features], axis=1)
+        else:
+            df_discharge = df_discharge_stations
+
+        for col in potential_discharge_cols: # Only convert numeric for discharge columns
+            # Use the cleaned name for conversion
+            cleaned_col_name = clean_station_name(col)
+            if cleaned_col_name in df_discharge.columns:
+                df_discharge[cleaned_col_name] = pd.to_numeric(df_discharge[cleaned_col_name], errors='coerce')
+
     except Exception as e:
         print(f"FATAL: Could not load discharge data from '{discharge_path}'. Error: {e}")
         return None, None, None, None, None
@@ -109,25 +130,32 @@ def load_and_preprocess_data(discharge_path, lat_long_path, contrib_path=None):
         return None, None, None, None, None
 
     # *** FUNDAMENTAL FIX: Create a canonical list of stations ***
-    # Find the stations that are present in BOTH the discharge file and the coordinate file.
-    discharge_stations = set(df_discharge.columns)
+    # Find the stations that are present in BOTH the discharge file (after cleaning names) and the coordinate file.
+    # We need to use the *cleaned* discharge station names here.
+    discharge_stations_after_cleaning = set([col for col in df_discharge.columns if col in df_coords.index or not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))]) # Only consider actual stations for intersection
+
+    # Filter out temporal features from the "discharge_stations_after_cleaning" set, just in case
+    discharge_stations_after_cleaning = set([col for col in discharge_stations_after_cleaning if not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))])
+
     coords_stations = set(df_coords.index)
-    
-    canonical_stations = sorted(list(discharge_stations.intersection(coords_stations)))
-    
+
+    canonical_stations = sorted(list(discharge_stations_after_cleaning.intersection(coords_stations)))
+
     # Report on any stations that are being dropped
-    dropped_from_discharge = discharge_stations - coords_stations
+    dropped_from_discharge = discharge_stations_after_cleaning - coords_stations
     if dropped_from_discharge:
         print(f"Warning: The following stations are in the discharge file but missing coordinates. They will be DROPPED: {list(dropped_from_discharge)}")
-    
-    dropped_from_coords = coords_stations - discharge_stations
+
+    dropped_from_coords = coords_stations - discharge_stations_after_cleaning
     if dropped_from_coords:
         print(f"Warning: The following stations have coordinates but are not in the discharge file. They will be IGNORED: {list(dropped_from_coords)}")
 
     print(f"\nUsing {len(canonical_stations)} stations found in both discharge and coordinate files.")
 
     # Filter all dataframes to only use the canonical list of stations
-    df_discharge = df_discharge[canonical_stations]
+    # Preserve temporal features in df_discharge
+    cols_to_keep_in_discharge = canonical_stations + temporal_feature_cols
+    df_discharge = df_discharge[cols_to_keep_in_discharge]
     df_coords = df_coords.loc[canonical_stations]
 
     # Parse coordinates now that we have the final station list
@@ -152,7 +180,9 @@ def load_and_preprocess_data(discharge_path, lat_long_path, contrib_path=None):
                             contrib_pairs.append({'station': station_name, 'contributor': contributor_name})
             if contrib_pairs:
                 df_contrib = pd.DataFrame(contrib_pairs)
-                print(f"Loaded and parsed contributor matrix with {len(df_contrib)} relationships.")
+                # Filter contributor data to only include canonical stations
+                df_contrib = df_contrib[df_contrib['station'].isin(canonical_stations) & df_contrib['contributor'].isin(canonical_stations)]
+                print(f"Loaded and parsed contributor matrix with {len(df_contrib)} relationships (filtered for canonical stations).")
             else:
                 df_contrib = None
         except Exception as e:
@@ -173,6 +203,7 @@ def add_temporal_features(df):
     """Adds cyclical day-of-year features."""
     print("Adding cyclical temporal features (sin/cos)...")
     df_temp = df.copy()
+    df_temp.index = pd.to_datetime(df_temp.index)
     day_of_year = df_temp.index.dayofyear
     df_temp['day_of_year_sin'] = np.sin(2 * np.pi * day_of_year / 366.0)
     df_temp['day_of_year_cos'] = np.cos(2 * np.pi * day_of_year / 366.0)
@@ -214,20 +245,24 @@ def build_connectivity_matrix(df_contrib, discharge_cols, station_name_to_vcode)
     return connectivity_matrix
 
 
-def create_continuous_gaps(df_data, discharge_target_columns, gap_lengths, random_seed=42):
+def create_contiguous_segment_gaps(df_data, discharge_target_columns, gap_lengths, random_seed=42, num_intervals_per_column=5): # Added num_intervals_per_column with a default of 5
     """
     Introduces continuous gaps (NaNs) into random discharge columns of the DataFrame
-    for each specified gap length.
+    for each specified gap length. Each gap length is applied to each discharge column.
+    Multiple non-overlapping intervals of the specified gap_length are created per column.
 
     Args:
         df_data (pd.DataFrame): The input DataFrame (assumed to be complete for creating gaps).
         discharge_target_columns (list): A list of column names representing the true discharge data.
         gap_lengths (list): A list of integers, each representing the length of a continuous gap in days.
         random_seed (int): Seed for reproducibility.
+        num_intervals_per_column (int): The number of non-overlapping contiguous intervals of `gap_length`
+                                        to introduce in each discharge column.
 
     Returns:
         dict: A dictionary where keys are gap lengths and values are dictionaries
               containing 'gapped_data', 'true_values', and 'mask' for that gap length.
+              'true_values' and 'mask' will be dictionaries mapping column names to arrays.
     """
     np.random.seed(random_seed)
     results = {}
@@ -245,46 +280,126 @@ def create_continuous_gaps(df_data, discharge_target_columns, gap_lengths, rando
             continue
 
         df_gapped_for_length = df_data.copy()
-        true_values_for_length = pd.Series(dtype=float)
-        
-        # Initialize mask with the shape of only the discharge target columns
-        mask_for_length = np.zeros(df_data[discharge_target_columns].shape, dtype=bool)
+        true_values_for_length = {}
+        mask_for_length = {}
 
-        # Select a random discharge column to introduce the gap from the target columns
-        target_column = np.random.choice(discharge_target_columns)
-        
-        data_length = len(df_gapped_for_length)
-        if gap_length >= data_length:
-            print(f"Warning: Gap length ({gap_length}) is >= data length ({data_length}) for column {target_column}. Setting entire column to NaN.")
-            df_gapped_for_length[target_column] = np.nan
-            true_values_for_length = df_data[target_column].copy() # Store all original values
+        for target_column in discharge_target_columns:
+            data_length = len(df_gapped_for_length)
             
-            # Update mask for the entire target column within the discharge_target_columns subset
-            col_idx_in_target = list(discharge_target_columns).index(target_column)
-            mask_for_length[:, col_idx_in_target] = True
-        else:
-            # Determine a random start index for the gap
-            max_start_idx = data_length - gap_length
-            if max_start_idx < 0: # Should not happen if gap_length < data_length
-                start_idx = 0
+            if gap_length >= data_length:
+                print(f"Warning: Gap length ({gap_length}) is >= data length ({data_length}) for column {target_column}. Setting entire column to NaN.")
+                true_values_for_length[target_column] = df_data[target_column].copy().values
+                df_gapped_for_length[target_column] = np.nan
+                mask_for_length[target_column] = np.ones(data_length, dtype=bool)
             else:
-                start_idx = np.random.randint(0, max_start_idx + 1)
-            end_idx = start_idx + gap_length
+                num_intervals_to_create = min(num_intervals_per_column, data_length // gap_length)
+                
+                possible_start_indices = np.arange(data_length - gap_length + 1)
+                np.random.shuffle(possible_start_indices)
 
-            # Store true values before masking
-            true_values_for_length = df_data.loc[df_data.index[start_idx:end_idx], target_column].copy()
-            
-            # Create mask for the specific gap within the discharge_target_columns subset
-            col_idx_in_target = list(discharge_target_columns).index(target_column)
-            mask_for_length[start_idx:end_idx, col_idx_in_target] = True
+                gaps_to_apply = [] # List of (start_idx, end_idx) tuples for current column
+                
+                for start_candidate in possible_start_indices:
+                    end_candidate = start_candidate + gap_length
+                    
+                    # Check for overlap with already chosen gaps
+                    is_overlapping = False
+                    for existing_start, existing_end in gaps_to_apply:
+                        # Check for any overlap, including touching boundaries or full containment
+                        if not (end_candidate <= existing_start or start_candidate >= existing_end):
+                            is_overlapping = True
+                            break
+                    
+                    if not is_overlapping:
+                        gaps_to_apply.append((start_candidate, end_candidate))
+                        if len(gaps_to_apply) == num_intervals_to_create:
+                            break
+                
+                if len(gaps_to_apply) < num_intervals_to_create:
+                    print(f"Warning: Could only create {len(gaps_to_apply)} non-overlapping segments of length {gap_length} for column {target_column} (requested {num_intervals_to_create}).")
+                
+                # Apply all selected gaps for this column
+                col_true_values = np.array([])
+                col_mask = np.zeros(data_length, dtype=bool)
 
-            # Introduce NaN values in the full DataFrame
-            df_gapped_for_length.loc[df_gapped_for_length.index[start_idx:end_idx], target_column] = np.nan
+                for start_idx, end_idx in gaps_to_apply:
+                    col_true_values = np.concatenate([col_true_values, df_data.loc[df_data.index[start_idx:end_idx], target_column].copy().values])
+                    col_mask[start_idx:end_idx] = True
+                    df_gapped_for_length.loc[df_gapped_for_length.index[start_idx:end_idx], target_column] = np.nan
+                
+                true_values_for_length[target_column] = col_true_values
+                mask_for_length[target_column] = col_mask
         
         results[gap_length] = {
             'gapped_data': df_gapped_for_length,
-            'true_values': true_values_for_length.values, # Flatten to numpy array
-            'mask': mask_for_length # This mask is for the discharge_target_columns shape
+            'true_values': true_values_for_length, 
+            'mask': mask_for_length
+        }
+    return results
+
+def create_single_point_gaps(df_data, discharge_target_columns, num_gaps_per_column, random_seed=42):
+    """
+    Introduces single random missing data points (NaNs) into specified discharge columns.
+
+    Args:
+        df_data (pd.DataFrame): The input DataFrame (assumed to be complete for creating gaps).
+        discharge_target_columns (list): A list of column names representing the true discharge data.
+        num_gaps_per_column (dict): A dictionary where keys are gap counts and values are dictionaries
+                                    containing 'gapped_data', 'true_values', and 'mask' for that gap count.
+                                    'true_values' and 'mask' will be dictionaries mapping column names to arrays.
+        random_seed (int): Seed for reproducibility.
+
+    Returns:
+        dict: A dictionary where keys are gap lengths and values are dictionaries
+              containing 'gapped_data', 'true_values', and 'mask' for that gap count.
+              'true_values' and 'mask' will be dictionaries mapping column names to arrays.
+    """
+    np.random.seed(random_seed)
+    results = {}
+
+    discharge_target_columns = [col for col in df_data.columns if not (col.startswith('day_of_year_') or col.startswith('month_') or col.startswith('week_of_year_'))]
+
+    if not discharge_target_columns:
+        print("Warning: No discharge target columns provided to introduce gaps. Returning empty results.")
+        return results
+
+    for num_gaps_key, num_gaps_value in num_gaps_per_column.items():
+        df_gapped_for_length = df_data.copy()
+        true_values_for_length = {}
+        mask_for_length = {}
+
+        for target_column in discharge_target_columns:
+            data_length = len(df_gapped_for_length)
+            if data_length == 0: continue
+
+            # Calculate number of gaps as a percentage of data length
+            n_gaps = int(data_length * (num_gaps_value / 365.0)) # Assuming num_gaps_value is in days for comparison
+            if n_gaps == 0 and num_gaps_value > 0: n_gaps = 1 # Ensure at least one gap if requested
+
+            if n_gaps >= data_length:
+                print(f"Warning: Number of single point gaps ({n_gaps}) is >= data length ({data_length}) for column {target_column}. Setting entire column to NaN.")
+                true_values_for_length[target_column] = df_data[target_column].copy().values
+                df_gapped_for_length[target_column] = np.nan
+                mask_for_length[target_column] = np.ones(data_length, dtype=bool)
+            else:
+                # Select random indices for gaps
+                gap_indices = np.random.choice(data_length, n_gaps, replace=False)
+
+                # Store true values before masking
+                true_values_for_length[target_column] = df_data.loc[df_data.index[gap_indices], target_column].copy().values
+
+                # Create mask for the specific gaps
+                col_mask = np.zeros(data_length, dtype=bool)
+                col_mask[gap_indices] = True
+                mask_for_length[target_column] = col_mask
+
+                # Introduce NaN values
+                df_gapped_for_length.loc[df_gapped_for_length.index[gap_indices], target_column] = np.nan
+        
+        results[num_gaps_key] = {
+            'gapped_data': df_gapped_for_length,
+            'true_values': true_values_for_length,
+            'mask': mask_for_length
         }
     return results
 
@@ -315,7 +430,11 @@ def evaluate_metrics(y_true, y_pred):
     
     r2 = 1 - (ss_residual / ss_total) if ss_total > 0 else np.nan
 
-    return {'RMSE': rmse, 'MAE': mae, 'R2': r2}
+    # Calculate Nash-Sutcliffe Efficiency (NSE)
+    # NSE = 1 - (SS_res / SS_tot)
+    nse = 1 - (ss_residual / ss_total) if ss_total > 0 else np.nan
+
+    return {'RMSE': rmse, 'MAE': mae, 'R2': r2, 'NSE': nse}
 
 def plot_results(y_true, y_pred, gap_length, plot_dir="plots"):
     """
