@@ -5,7 +5,7 @@ import os
 import tempfile
 import atexit
 from eval import evaluate_metrics
-from burst_pipeline import run_rolling_imputation_pipeline
+from simplified_burst_pipeline import BurstImputer
 from utils import (
     load_and_preprocess_data,
     add_temporal_features,
@@ -26,136 +26,118 @@ def evaluate_burst_pipeline(
 ):
     """
     Simplified evaluation of the burst pipeline on artificial gaps.
+    This version loads the correct cached model for each gapped period.
     """
     os.makedirs(output_dir, exist_ok=True)
     
     print("--- Starting Burst Pipeline Evaluation ---")
     
-    # Load and preprocess data
-    print("Loading data...")
+    # 1. Load and prepare the original data
+    print("Loading and preparing data...")
     df_original, df_contrib, df_coords, vcode_to_station, station_to_vcode = \
         load_and_preprocess_data(discharge_path, lat_long_path, contrib_path)
-    
-    if df_original is None:
-        print("ERROR: Failed to load data. Exiting.")
-        return None
-    
-    # Add temporal features
     df_with_features = add_temporal_features(df_original)
-    discharge_cols = [col for col in df_original.columns if not col.startswith('day_of_year_')]
     
-    # Track temporary files for cleanup
-    temp_files = []
-    atexit.register(lambda: [os.remove(f) for f in temp_files if os.path.exists(f)])
+    # 2. Instantiate imputer and pre-train all rolling models
+    imputer = BurstImputer(
+        initial_train_window_size=initial_train_window_size,
+        min_completeness_percent_train=min_completeness_percent_train
+    )
+    
+    print("\nPre-training and caching models for all rolling periods...")
+    imputer.impute_rolling_windows(
+        df_with_features=df_with_features,
+        df_coords=df_coords,
+        df_contrib=df_contrib,
+        imputation_chunk_size_years=imputation_chunk_size_years
+    )
     
     all_results = []
     
-    # Evaluate contiguous gaps
-    if gap_lengths_contiguous:
-        print("\n--- Evaluating Contiguous Gaps ---")
-        for length in gap_lengths_contiguous:
-            print(f"Processing {length}-day contiguous gaps...")
+    # 3. Evaluate with contiguous gaps using the cached models
+    print("\n--- Evaluating Contiguous Gaps ---")
+    for length in gap_lengths_contiguous:
+        print(f"Creating and evaluating gaps of length: {length}")
+        gaps_info = create_contiguous_segment_gaps(df_with_features, length=length)
+        
+        for num_gaps_key, gap_data in gaps_info.items():
+            df_gapped_features = gap_data['gapped_data']
+            true_values = gap_data['true_values']
             
-            # Create gaps
-            gap_results = create_contiguous_segment_gaps(
-                df_with_features, discharge_cols, [length], random_seed=42
-            )
-            gapped_data = gap_results[length]['gapped_data']
-            true_values = gap_results[length]['true_values']
-            mask = gap_results[length]['mask']
+            # Identify the year of the gapped data to select the correct model
+            gap_year = df_gapped_features.index.year[0]
+            start_year = int(np.floor(gap_year / imputation_chunk_size_years) * imputation_chunk_size_years)
+            end_year = start_year + initial_train_window_size
             
-            # Save to temporary file
-            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='_gapped.csv', delete=False)
-            gapped_data.to_csv(temp_file.name, index=True, date_format='%Y-%m-%d')
-            temp_file.close()
-            temp_files.append(temp_file.name)
+            # Load the correct cached model
+            cache_key = imputer._create_cache_key(df_gapped_features, start_year, end_year)
+            model = imputer.load_model_from_cache(cache_key)
             
-            # Run burst pipeline
-            imputed_data = run_rolling_imputation_pipeline(
-                discharge_path=temp_file.name,
-                lat_long_path=lat_long_path,
-                contrib_path=contrib_path,
-                initial_train_window_size=initial_train_window_size,
-                imputation_chunk_size_years=imputation_chunk_size_years,
-                overall_min_year=df_original.index.year.min(),
-                overall_max_year=df_original.index.year.max(),
-                min_completeness_percent_train=min_completeness_percent_train,
-                output_dir=os.path.join(output_dir, f"burst_contiguous_{length}")
-            )
-            
-            if imputed_data is not None and not imputed_data.empty:
-                # Calculate metrics
-                y_true, y_pred = [], []
-                for col in discharge_cols:
-                    y_true.extend(true_values[col])
-                    gapped_indices = df_with_features.index[mask[col]]
-                    if col in imputed_data.columns:
-                        y_pred.extend(imputed_data.loc[gapped_indices, col].values)
-                    else:
-                        y_pred.extend([np.nan] * len(true_values[col]))
+            if model is None:
+                print(f"Warning: No model found for period {start_year}-{end_year}. Skipping.")
+                continue
                 
-                metrics = evaluate_metrics(np.array(y_true), np.array(y_pred))
-                metrics.update({
-                    'Gap Type': 'Contiguous',
-                    'Gap Length': length,
-                    'Model': 'Burst Pipeline'
-                })
-                all_results.append(metrics)
-                print(f"  Metrics: {metrics}")
-    
-    # Evaluate single point gaps
-    if gap_lengths_single_point:
-        print("\n--- Evaluating Single Point Gaps ---")
-        for length in gap_lengths_single_point:
-            print(f"Processing {length}-day equivalent single point gaps...")
+            # Use the pre-trained model to impute
+            imputed_data = imputer.impute(model, df_gapped_features)
             
-            # Create gaps
-            gap_config = {length: length}
-            gap_results = create_single_point_gaps(
-                df_with_features, discharge_cols, gap_config, random_seed=42
-            )
-            gapped_data = gap_results[length]['gapped_data']
-            true_values = gap_results[length]['true_values']
-            mask = gap_results[length]['mask']
+            # Calculate metrics
+            y_true, y_pred = [], []
+            discharge_cols = [col for col in df_original.columns if col in df_gapped_features.columns]
+            for col in discharge_cols:
+                y_true.extend(true_values.get(col, []))
+                if col in imputed_data.columns:
+                    y_pred.extend(imputed_data.loc[df_gapped_features.index, col].values)
             
-            # Save to temporary file
-            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='_gapped.csv', delete=False)
-            gapped_data.to_csv(temp_file.name, index=True, date_format='%Y-%m-%d')
-            temp_file.close()
-            temp_files.append(temp_file.name)
+            metrics = evaluate_metrics(np.array(y_true), np.array(y_pred))
+            metrics.update({
+                'Gap Type': 'Contiguous Segment',
+                'Gap Length': length,
+                'Model': 'Burst Pipeline'
+            })
+            all_results.append(metrics)
+            print(f"  Metrics: {metrics}")
+
+    # 4. Evaluate with single-point gaps using the same trained models
+    print("\n--- Evaluating Single-Point Gaps ---")
+    for length in gap_lengths_single_point:
+        print(f"Creating and evaluating gaps with {length} single points")
+        gaps_info = create_single_point_gaps(df_with_features, num_gaps=length)
+        
+        for num_gaps_key, gap_data in gaps_info.items():
+            df_gapped_features = gap_data['gapped_data']
+            true_values = gap_data['true_values']
             
-            # Run burst pipeline
-            imputed_data = run_rolling_imputation_pipeline(
-                discharge_path=temp_file.name,
-                lat_long_path=lat_long_path,
-                contrib_path=contrib_path,
-                initial_train_window_size=initial_train_window_size,
-                imputation_chunk_size_years=imputation_chunk_size_years,
-                overall_min_year=df_original.index.year.min(),
-                overall_max_year=df_original.index.year.max(),
-                min_completeness_percent_train=min_completeness_percent_train,
-                output_dir=os.path.join(output_dir, f"burst_single_{length}")
-            )
+            # Use the same logic to load the correct cached model
+            gap_year = df_gapped_features.index.year[0]
+            start_year = int(np.floor(gap_year / imputation_chunk_size_years) * imputation_chunk_size_years)
+            end_year = start_year + initial_train_window_size
             
-            if imputed_data is not None and not imputed_data.empty:
-                # Calculate metrics
-                y_true, y_pred = [], []
-                for col in discharge_cols:
-                    y_true.extend(true_values[col])
-                    gapped_indices = df_with_features.index[mask[col]]
-                    if col in imputed_data.columns:
-                        y_pred.extend(imputed_data.loc[gapped_indices, col].values)
-                    else:
-                        y_pred.extend([np.nan] * len(true_values[col]))
+            cache_key = imputer._create_cache_key(df_gapped_features, start_year, end_year)
+            model = imputer.load_model_from_cache(cache_key)
+            
+            if model is None:
+                print(f"Warning: No model found for period {start_year}-{end_year}. Skipping.")
+                continue
                 
-                metrics = evaluate_metrics(np.array(y_true), np.array(y_pred))
-                metrics.update({
-                    'Gap Type': 'Single Point',
-                    'Gap Length': length,
-                    'Model': 'Burst Pipeline'
-                })
-                all_results.append(metrics)
-                print(f"  Metrics: {metrics}")
+            # Use the pre-trained model to impute
+            imputed_data = imputer.impute(model, df_gapped_features)
+            
+            # Calculate metrics
+            y_true, y_pred = [], []
+            discharge_cols = [col for col in df_original.columns if col in df_gapped_features.columns]
+            for col in discharge_cols:
+                y_true.extend(true_values.get(col, []))
+                if col in imputed_data.columns:
+                    y_pred.extend(imputed_data.loc[df_gapped_features.index, col].values)
+
+            metrics = evaluate_metrics(np.array(y_true), np.array(y_pred))
+            metrics.update({
+                'Gap Type': 'Single Point',
+                'Gap Length': length,
+                'Model': 'Burst Pipeline'
+            })
+            all_results.append(metrics)
+            print(f"  Metrics: {metrics}")
     
     # Save results
     if all_results:

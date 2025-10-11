@@ -309,14 +309,14 @@ def create_single_point_gaps(df_data, discharge_cols, num_gaps_per_column, rando
     return results
 
 def evaluate_metrics(y_true, y_pred):
-    """Calculate evaluation metrics (RMSE, MAE, R2, NSE)."""
+    """Calculate evaluation metrics (RMSE, MAE, R2, NSE, KGE)."""
     # Filter out NaN values
     valid_indices = ~np.isnan(y_true) & ~np.isnan(y_pred)
     y_true_clean = y_true[valid_indices]
     y_pred_clean = y_pred[valid_indices]
 
     if len(y_true_clean) == 0:
-        return {'RMSE': np.nan, 'MAE': np.nan, 'R2': np.nan, 'NSE': np.nan}
+        return {'RMSE': np.nan, 'MAE': np.nan, 'R2': np.nan, 'NSE': np.nan, 'KGE': np.nan}
 
     rmse = np.sqrt(np.mean((y_true_clean - y_pred_clean)**2))
     mae = np.mean(np.abs(y_true_clean - y_pred_clean))
@@ -327,4 +327,240 @@ def evaluate_metrics(y_true, y_pred):
     r2 = 1 - (ss_residual / ss_total) if ss_total > 0 else np.nan
     nse = 1 - (ss_residual / ss_total) if ss_total > 0 else np.nan
 
-    return {'RMSE': rmse, 'MAE': mae, 'R2': r2, 'NSE': nse}
+    # Calculate Kling Gupta Efficiency (KGE)
+    kge = calculate_kge(y_true_clean, y_pred_clean)
+
+    return {'RMSE': rmse, 'MAE': mae, 'R2': r2, 'NSE': nse, 'KGE': kge}
+
+def calculate_kge(y_true, y_pred):
+    """Calculate Kling Gupta Efficiency (KGE).
+    
+    KGE = 1 - sqrt((r - 1)^2 + (beta - 1)^2 + (gamma - 1)^2)
+    
+    Where:
+    - r = correlation coefficient
+    - beta = mean(y_pred) / mean(y_true) (bias ratio)
+    - gamma = std(y_pred) / std(y_true) (variability ratio)
+    """
+    if len(y_true) == 0 or len(y_pred) == 0:
+        return np.nan
+    
+    # Correlation coefficient
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    if np.isnan(r):
+        r = 0
+    
+    # Bias ratio (beta)
+    mean_true = np.mean(y_true)
+    mean_pred = np.mean(y_pred)
+    if mean_true == 0:
+        beta = np.nan if mean_pred != 0 else 1.0
+    else:
+        beta = mean_pred / mean_true
+    
+    # Variability ratio (gamma)
+    std_true = np.std(y_true)
+    std_pred = np.std(y_pred)
+    if std_true == 0:
+        gamma = np.nan if std_pred != 0 else 1.0
+    else:
+        gamma = std_pred / std_true
+    
+    # Handle NaN values in beta or gamma
+    if np.isnan(beta) or np.isnan(gamma):
+        return np.nan
+    
+    # Calculate KGE
+    kge = 1 - np.sqrt((r - 1)**2 + (beta - 1)**2 + (gamma - 1)**2)
+    
+    return kge
+
+def historical_mean_imputation(df_data, discharge_cols, min_years_for_mean=2):
+    """
+    Impute missing values using historical mean for each day of year.
+    For day X, use the average value of day X across all prior years.
+    
+    Args:
+        df_data: DataFrame with datetime index
+        discharge_cols: List of discharge column names to impute
+        min_years_for_mean: Minimum number of years needed to calculate historical mean
+    
+    Returns:
+        DataFrame with imputed values
+    """
+    df_imputed = df_data.copy()
+    
+    for col in discharge_cols:
+        if col not in df_data.columns:
+            continue
+            
+        print(f"Applying historical mean imputation to {col}...")
+        
+        # Calculate column mean as ultimate fallback
+        column_mean = df_data[col].mean()
+        if pd.isna(column_mean):
+            column_mean = 0.0  # Default value for completely empty columns
+        
+        # Get day of year for each date
+        day_of_year = df_data.index.dayofyear
+        
+        for i, (date, value) in enumerate(df_data[col].items()):
+            if pd.isna(value):
+                current_day = day_of_year[i]
+                current_year = date.year
+                
+                # Find historical values for the same day of year from prior years
+                historical_data = df_data[
+                    (df_data.index.dayofyear == current_day) & 
+                    (df_data.index.year < current_year)
+                ][col]
+                
+                # Filter out NaN values from historical data
+                historical_values = historical_data.dropna()
+                
+                if len(historical_values) >= min_years_for_mean:
+                    # Use mean of historical values for this day of year
+                    imputed_value = historical_values.mean()
+                    df_imputed.loc[date, col] = imputed_value
+                else:
+                    # Fallback to column mean if insufficient historical data
+                    df_imputed.loc[date, col] = column_mean
+        
+        # Ensure ALL missing values are filled (additional safety check)
+        remaining_nans = df_imputed[col].isnull().sum()
+        if remaining_nans > 0:
+            print(f"Warning: {remaining_nans} NaN values still remain in {col}, filling with column mean")
+            df_imputed[col] = df_imputed[col].fillna(column_mean)
+    
+    return df_imputed
+
+def seasonal_mean_imputation(df_data, discharge_cols, window_days=15):
+    """
+    Impute missing values using seasonal mean within a window around the missing day.
+    
+    Args:
+        df_data: DataFrame with datetime index
+        discharge_cols: List of discharge column names to impute
+        window_days: Number of days before and after to include in seasonal mean
+    
+    Returns:
+        DataFrame with imputed values
+    """
+    df_imputed = df_data.copy()
+    
+    for col in discharge_cols:
+        if col not in df_data.columns:
+            continue
+            
+        print(f"Applying seasonal mean imputation to {col}...")
+        
+        # Calculate column mean as ultimate fallback
+        column_mean = df_data[col].mean()
+        if pd.isna(column_mean):
+            column_mean = 0.0  # Default value for completely empty columns
+        
+        for i, (date, value) in enumerate(df_data[col].items()):
+            if pd.isna(value):
+                # Create window around the missing date
+                start_date = date - pd.Timedelta(days=window_days)
+                end_date = date + pd.Timedelta(days=window_days)
+                
+                # Get data within the window, excluding the missing date itself
+                window_data = df_data[
+                    (df_data.index >= start_date) & 
+                    (df_data.index <= end_date) & 
+                    (df_data.index != date)
+                ][col]
+                
+                # Filter out NaN values
+                window_values = window_data.dropna()
+                
+                if len(window_values) > 0:
+                    # Use mean of values within the seasonal window
+                    imputed_value = window_values.mean()
+                    df_imputed.loc[date, col] = imputed_value
+                else:
+                    # Fallback to column mean if no valid window data
+                    df_imputed.loc[date, col] = column_mean
+        
+        # Ensure ALL missing values are filled (additional safety check)
+        remaining_nans = df_imputed[col].isnull().sum()
+        if remaining_nans > 0:
+            print(f"Warning: {remaining_nans} NaN values still remain in {col}, filling with column mean")
+            df_imputed[col] = df_imputed[col].fillna(column_mean)
+    
+    return df_imputed
+
+def simple_column_mean_imputation(df_data, discharge_cols):
+    """
+    Simple imputation using column means (baseline method).
+    
+    Args:
+        df_data: DataFrame with datetime index
+        discharge_cols: List of discharge column names to impute
+    
+    Returns:
+        DataFrame with imputed values
+    """
+    df_imputed = df_data.copy()
+    
+    for col in discharge_cols:
+        if col in df_data.columns:
+            column_mean = df_data[col].mean()
+            
+            # If column mean is NaN (all values are missing), use a default value
+            if pd.isna(column_mean):
+                print(f"Warning: Column {col} has all NaN values, using default value 0")
+                df_imputed[col] = df_imputed[col].fillna(0.0)
+            else:
+                df_imputed[col] = df_imputed[col].fillna(column_mean)
+    
+    return df_imputed
+
+def initialize_for_missforest(df_data, discharge_cols, initialization_method='column_mean', min_years_for_mean=2):
+    """
+    Initialize missing values using different methods for MissForest.
+    
+    Args:
+        df_data: DataFrame with datetime index
+        discharge_cols: List of discharge column names to initialize
+        initialization_method: Method to use ('column_mean', 'historical_mean', 'seasonal_mean')
+        min_years_for_mean: Minimum years for historical mean calculation
+    
+    Returns:
+        DataFrame with initialized values (guaranteed no NaN values)
+    """
+    if initialization_method == 'column_mean':
+        df_initialized = simple_column_mean_imputation(df_data, discharge_cols)
+    elif initialization_method == 'historical_mean':
+        df_initialized = historical_mean_imputation(df_data, discharge_cols, min_years_for_mean)
+    elif initialization_method == 'seasonal_mean':
+        df_initialized = seasonal_mean_imputation(df_data, discharge_cols, window_days=15)
+    else:
+        raise ValueError(f"Unknown initialization method: {initialization_method}")
+    
+    # Final safety check: ensure absolutely no NaN values remain
+    for col in discharge_cols:
+        if col in df_initialized.columns:
+            remaining_nans = df_initialized[col].isnull().sum()
+            if remaining_nans > 0:
+                print(f"Final safety check: {remaining_nans} NaN values found in {col}, filling with column mean")
+                column_mean = df_data[col].mean()
+                if pd.isna(column_mean):
+                    column_mean = 0.0  # Default value for completely empty columns
+                df_initialized[col] = df_initialized[col].fillna(column_mean)
+    
+    # Verify no NaN values remain
+    total_nans = df_initialized[discharge_cols].isnull().sum().sum()
+    if total_nans > 0:
+        print(f"ERROR: {total_nans} NaN values still remain after initialization!")
+        # Emergency fallback to simple column mean for all columns
+        for col in discharge_cols:
+            if col in df_initialized.columns:
+                column_mean = df_data[col].mean()
+                if pd.isna(column_mean):
+                    column_mean = 0.0  # Default value for completely empty columns
+                df_initialized[col] = df_initialized[col].fillna(column_mean)
+    
+    print(f"Initialization complete. Total NaN values remaining: {df_initialized[discharge_cols].isnull().sum().sum()}")
+    return df_initialized

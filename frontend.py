@@ -14,7 +14,7 @@ from burst_pipeline import run_rolling_imputation_pipeline
 # We only need to import the top-level function that runs the whole pipeline
 # The run_rolling_imputation_pipeline function in burst_pipeline.py handles all the sub-calls.
 # This assumes the burst_pipeline.py is self-contained in its execution flow.
-
+  
 warnings.filterwarnings('ignore')
 
 def gradio_pipeline_wrapper(discharge_file, lat_long_file, contrib_file, initial_train_window_size, imputation_chunk_size_years, overall_min_year, overall_max_year, min_completeness_percent_train):
