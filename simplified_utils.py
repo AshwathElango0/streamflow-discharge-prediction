@@ -564,3 +564,73 @@ def initialize_for_missforest(df_data, discharge_cols, initialization_method='co
     
     print(f"Initialization complete. Total NaN values remaining: {df_initialized[discharge_cols].isnull().sum().sum()}")
     return df_initialized
+
+def evaluate_imputation_performance(df_original, df_gapped, df_imputed, discharge_cols):
+    """
+    Evaluate imputation performance by comparing true values with imputed values
+    at the locations where artificial gaps were created.
+    """
+    y_true_eval, y_pred_eval = [], []
+
+    for station in discharge_cols:
+        if station not in df_imputed.columns:
+            continue
+            
+        # Find where the artificial gaps were created
+        gap_mask = df_gapped[station].isnull()
+        
+        if gap_mask.sum() > 0:
+            # Get the predicted values from our model at these specific gap locations
+            predicted_vals = df_imputed[station][gap_mask].values
+            
+            # Get the ground truth values from the original, non-gapped test data
+            true_vals = df_original[station][gap_mask].values
+            
+            y_pred_eval.extend(predicted_vals)
+            y_true_eval.extend(true_vals)
+
+    if y_true_eval:
+        # evaluate_metrics is already defined in this file
+        metrics = evaluate_metrics(np.array(y_true_eval), np.array(y_pred_eval))
+        return metrics
+    else:
+        return {'RMSE': np.nan, 'MAE': np.nan, 'R2': np.nan, 'NSE': np.nan, 'KGE': np.nan}
+
+def find_best_data_window(df, discharge_cols, start_date_str, end_date_str, window_size_days):
+    """
+    Finds the N-day window with the most non-NaN values within a given date range.
+
+    Args:
+        df: DataFrame with datetime index.
+        discharge_cols: List of columns to check for completeness.
+        start_date_str: Start of the search range (e.g., '1980-01-01').
+        end_date_str: End of the search range (e.g., '1990-12-31').
+        window_size_days: The size of the window to find (e.g., 1826 for 5 years).
+
+    Returns:
+        (best_start_date, best_end_date) as pd.Timestamps
+    """
+    print(f"Searching for best {window_size_days}-day window in {start_date_str} to {end_date_str}...")
+    df_range = df.loc[start_date_str:end_date_str].copy()
+    
+    if df_range.empty:
+        raise ValueError(f"No data found in the specified range {start_date_str} to {end_date_str}.")
+        
+    window_size_str = f"{window_size_days}D"
+    
+    # Calculate rolling completeness
+    # Sum non-NaN values per row, then get a rolling sum of this completeness score
+    completeness_series = df_range[discharge_cols].notna().sum(axis=1)
+    rolling_completeness = completeness_series.rolling(window=window_size_str, min_periods=window_size_days).sum()
+    
+    if rolling_completeness.dropna().empty:
+        raise ValueError(f"No complete windows of size {window_size_days} days found.")
+        
+    # Find the end date of the best window
+    best_end_date = rolling_completeness.idxmax()
+    best_start_date = best_end_date - pd.Timedelta(days=window_size_days - 1)
+    
+    print(f"Found best window: {best_start_date.date()} to {best_end_date.date()} "
+          f"with {rolling_completeness.max()} data points.")
+          
+    return best_start_date, best_end_date
